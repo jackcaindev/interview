@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+node_modules/
+.DS_Store
+*.pyc
+*.log
+postgres-data/

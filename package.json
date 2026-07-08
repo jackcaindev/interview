@@ -1,0 +1,11 @@
+{
+  "name": "manufacturing-agentic-workflow",
+  "private": true,
+  "scripts": {
+    "dev:backend": "cd backend && uv run uvicorn app.main:app --reload",
+    "dev:frontend": "cd frontend && pnpm dev",
+    "test:backend": "cd backend && uv run pytest",
+    "build:frontend": "cd frontend && pnpm build",
+    "compose:config": "docker compose config"
+  }
+}

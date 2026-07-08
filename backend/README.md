@@ -1,0 +1,29 @@
+# Manufacturing Agent Backend
+
+FastAPI backend exposing `POST /chat` for a LangChain supervisor agent that routes to safety, maintenance, and quality-control RAG specialists. Short-term conversation state uses the existing LangGraph checkpointer; cross-thread long-term memory uses the Postgres-backed LangGraph store.
+
+```bash
+uv sync
+uv run python -m app.ingest_sources --reset
+uv run uvicorn app.main:app --reload
+uv run pytest
+```
+
+## LangSmith observability and evals
+
+Tracing is disabled by default. To send supervisor and specialist traces to LangSmith, set:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=<your-langsmith-api-key>
+export LANGSMITH_PROJECT=manufacturing-supervisor
+```
+
+Run the golden evaluation after the database is running, source documents are ingested, and model provider keys are configured:
+
+```bash
+uv run python -m evals.golden_dataset
+uv run python -m evals.run_langsmith_eval
+```
+
+The golden dataset contains five cases: safety, maintenance, quality, one ambiguous hydraulic-press question, and one irrelevant picnic-playlist question. Custom evaluators score source routing, citation grounding, required content, and refusal behavior for irrelevant inputs.
