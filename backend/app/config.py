@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     )
     chat_model: str = Field(default="claude-sonnet-4-6", alias="CHAT_MODEL")
     supervisor_model: str = Field(default="", alias="SUPERVISOR_MODEL")
+    router_model: str = Field(default="", alias="ROUTER_MODEL")
     specialist_model: str = Field(default="", alias="SPECIALIST_MODEL")
     rag_top_k: int = Field(default=4, alias="RAG_TOP_K")
     rag_confidence_threshold: float = Field(default=0.72, alias="RAG_CONFIDENCE_THRESHOLD")
@@ -34,7 +35,16 @@ class Settings(BaseSettings):
     memory_embedding_dimensions: int = Field(default=1536, alias="MEMORY_EMBEDDING_DIMENSIONS")
     supervisor_model_call_run_limit: int = Field(default=4, alias="SUPERVISOR_MODEL_CALL_RUN_LIMIT")
     specialist_model_call_run_limit: int = Field(default=1, alias="SPECIALIST_MODEL_CALL_RUN_LIMIT")
+    redis_url: str = Field(default="", alias="REDIS_URL")
+    redis_timeout_seconds: float = Field(default=0.5, alias="REDIS_TIMEOUT_SECONDS")
+    rag_cache_ttl_seconds: int = Field(default=900, alias="RAG_CACHE_TTL_SECONDS")
+    rag_cache_namespace: str = Field(default="manufacturing-agent", alias="RAG_CACHE_NAMESPACE")
+    rag_cache_max_question_chars: int = Field(default=2000, alias="RAG_CACHE_MAX_QUESTION_CHARS")
     vite_api_proxy_target: str = Field(default="http://localhost:8000", alias="VITE_API_PROXY_TARGET")
+    cors_allowed_origins: str = Field(
+        default="http://localhost:5173,http://127.0.0.1:5173",
+        alias="CORS_ALLOWED_ORIGINS",
+    )
 
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 

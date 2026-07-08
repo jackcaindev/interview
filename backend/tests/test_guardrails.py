@@ -3,7 +3,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.store.memory import InMemoryStore
 
 from app import agent as agent_module
-from app.agent import LLMSourceGrader, LLMSourcedAnswerGenerator, SupervisorAgent
+from app.agent import LLMSourceGrader, LLMSourcedAnswerGenerator, RouteDecision, SupervisorAgent
 from app.guardrails import (
     PROMPT_INJECTION_BLOCKED_MESSAGE,
     PromptInjectionMiddleware,
@@ -17,12 +17,18 @@ class FakeSettings:
 
 
 class FakeCompiledAgent:
-    pass
+    def invoke(self, *args, **kwargs):
+        return {"messages": ["ok"]}
 
 
 class FakeSpecialist:
     def answer(self, question: str) -> str:
         return f"answer: {question}"
+
+
+class AmbiguousRouter:
+    def route(self, message: str) -> RouteDecision:
+        return RouteDecision(route="ambiguous", confidence=1.0, reason="test route")
 
 
 def test_prompt_injection_middleware_allows_safe_manufacturing_question() -> None:
@@ -78,15 +84,17 @@ def test_supervisor_agent_wires_guardrail_middleware(monkeypatch) -> None:
 
     monkeypatch.setattr(agent_module, "create_agent", fake_create_agent)
 
-    SupervisorAgent(
+    supervisor = SupervisorAgent(
         specialists={
             "safety": FakeSpecialist(),
             "maintenance": FakeSpecialist(),
             "quality": FakeSpecialist(),
         },
+        router=AmbiguousRouter(),
         settings=FakeSettings(),
         store=InMemoryStore(),
     )
+    supervisor.invoke("Can you help me with yesterday's issue?", "floor-a")
 
     middleware = captured_kwargs[0]["middleware"]
     assert any(isinstance(item, PromptInjectionMiddleware) for item in middleware)

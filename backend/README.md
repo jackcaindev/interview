@@ -9,6 +9,14 @@ uv run uvicorn app.main:app --reload
 uv run pytest
 ```
 
+## Cache
+
+Specialist RAG answers are cached by source, normalized question, source-document fingerprint, model, embedding model, and RAG settings. Set `REDIS_URL` to use Redis, leave it empty for a per-process cache, or set `RAG_CACHE_TTL_SECONDS=0` to disable caching. If Redis is configured but unavailable, answers also write through to a per-process fallback cache.
+
+`RAG_USE_LLM_GRADER=false` is the default fast path. Set it to `true` only when you want an extra LLM confidence check before answer generation and can accept the added latency.
+
+The chat router handles clear safety, maintenance, and quality questions with deterministic routing, then uses a structured LLM router for ambiguous wording. Set `ROUTER_MODEL` to tune that router independently from the supervisor and specialist answer models.
+
 ## LangSmith observability and evals
 
 Tracing is disabled by default. To send supervisor and specialist traces to LangSmith, set:

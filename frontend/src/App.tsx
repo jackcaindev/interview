@@ -1,5 +1,5 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react"
-import { AlertCircle, Factory, Loader2, Send, ShieldCheck } from "lucide-react"
+import { AlertCircle, Factory, Loader2, Plus, Send, ShieldCheck } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -19,7 +19,18 @@ type ParsedSseEvent = {
   data: unknown
 }
 
+type CommonQuestion = {
+  id: string
+  category: string
+  label: string
+  question: string
+}
+
 const THREAD_STORAGE_KEY = "manufacturing-help-desk-conversation-id"
+const CHAT_MESSAGE_MAX_LENGTH = 2000
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "")
+const STREAM_FLUSH_INTERVAL_MS = 140
+const STREAM_FORCE_FLUSH_CHARS = 240
 
 const starterMessages: ChatMessage[] = [
   {
@@ -122,6 +133,72 @@ function errorMessageFromPayload(payload: unknown) {
   }
 
   return "Unable to stream the help desk response."
+}
+
+function apiUrl(path: string) {
+  if (!API_BASE_URL) {
+    return path
+  }
+
+  return `${API_BASE_URL}${path.replace(/^\/api/, "")}`
+}
+
+function commonQuestionsFromPayload(payload: unknown) {
+  if (!isRecord(payload) || !Array.isArray(payload.questions)) {
+    return []
+  }
+
+  return payload.questions.filter(isCommonQuestion)
+}
+
+function isCommonQuestion(value: unknown): value is CommonQuestion {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.category === "string" &&
+    typeof value.label === "string" &&
+    typeof value.question === "string" &&
+    value.id.length > 0 &&
+    value.category.length > 0 &&
+    value.label.length > 0 &&
+    value.question.length > 0
+  )
+}
+
+function HelpMessageContent({ content }: { content: string }) {
+  const { body, confidence } = splitSourceConfidence(content)
+
+  return (
+    <div className="space-y-3">
+      <MarkdownContent content={body} />
+      {confidence !== null ? (
+        <div className="rounded-md border border-emerald-900/70 bg-emerald-950/40 p-3">
+          <div className="mb-2 flex items-center justify-between gap-3 text-xs font-medium text-emerald-100">
+            <span>Source confidence</span>
+            <span>{confidence}%</span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-zinc-800">
+            <div className="h-full rounded-full bg-emerald-400" style={{ width: `${confidence}%` }} />
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function splitSourceConfidence(content: string) {
+  const match = content.match(/\n*\*\*Source confidence:\*\*\s*(\d{1,3})%\s*$/i)
+
+  if (!match) {
+    return { body: content, confidence: null as number | null }
+  }
+
+  const confidence = Math.max(0, Math.min(100, Number(match[1])))
+  const footerStart = match.index ?? content.length
+  return {
+    body: content.slice(0, footerStart).trimEnd(),
+    confidence,
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -382,8 +459,48 @@ function findNextInlineSpecial(text: string, start: number) {
   return indexes.length > 0 ? Math.min(...indexes) : text.length
 }
 
+function CommonQuestionsSection({
+  className,
+  isSending,
+  onQuestionClick,
+  questions,
+}: {
+  className?: string
+  isSending: boolean
+  onQuestionClick: (question: string) => void
+  questions: CommonQuestion[]
+}) {
+  if (questions.length === 0) {
+    return null
+  }
+
+  return (
+    <section aria-label="Common questions" className={cn("space-y-2", className)}>
+      <h2 className="text-sm font-medium text-zinc-100">
+        Common Questions
+      </h2>
+      <div className="space-y-2">
+        {questions.map((question) => (
+          <button
+            key={question.id}
+            aria-label={`Ask: ${question.question}`}
+            className="block w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-left transition hover:border-emerald-700 hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={isSending}
+            onClick={() => onQuestionClick(question.question)}
+            type="button"
+          >
+            <span className="block text-xs font-medium text-emerald-300">{question.category}</span>
+            <span className="block text-sm leading-5 text-zinc-100">{question.label}</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function App() {
   const [messages, setMessages] = useState<ChatMessage[]>(starterMessages)
+  const [commonQuestions, setCommonQuestions] = useState<CommonQuestion[]>([])
   const [draft, setDraft] = useState("")
   const [threadId, setThreadId] = useState<string | null>(() => localStorage.getItem(THREAD_STORAGE_KEY))
   const [isSending, setIsSending] = useState(false)
@@ -397,11 +514,46 @@ function App() {
     })
   }, [messages, isSending])
 
-  const canSend = useMemo(() => draft.trim().length > 0 && !isSending, [draft, isSending])
+  useEffect(() => {
+    let isCancelled = false
 
-  async function submitMessage(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const message = draft.trim()
+    async function loadCommonQuestions() {
+      try {
+        const response = await fetch(apiUrl("/api/common-questions"))
+
+        if (!response.ok) {
+          throw new Error(`Request failed with status ${response.status}`)
+        }
+
+        const payload = (await response.json()) as unknown
+        const questions = commonQuestionsFromPayload(payload)
+
+        if (!isCancelled) {
+          setCommonQuestions(questions)
+        }
+      } catch {
+        if (!isCancelled) {
+          setCommonQuestions([])
+        }
+      }
+    }
+
+    void loadCommonQuestions()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [])
+
+  const canSend = useMemo(() => draft.trim().length > 0 && !isSending, [draft, isSending])
+  const isAwaitingFirstResponse = useMemo(() => {
+    const latestMessage = messages.at(-1)
+
+    return isSending && latestMessage?.role === "help" && latestMessage.content.length === 0
+  }, [isSending, messages])
+
+  async function sendMessage(rawMessage: string) {
+    const message = rawMessage.trim()
 
     if (!message || isSending) {
       return
@@ -423,12 +575,55 @@ function App() {
         content: "",
       },
     ])
-    setDraft("")
     setError(null)
     setIsSending(true)
 
+    let pendingTokenText = ""
+    let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+    function flushPendingTokens() {
+      if (flushTimer) {
+        clearTimeout(flushTimer)
+        flushTimer = null
+      }
+
+      if (!pendingTokenText) {
+        return
+      }
+
+      const nextText = pendingTokenText
+      pendingTokenText = ""
+
+      setMessages((current) =>
+        current.map((currentMessage) =>
+          currentMessage.id === helpMessageId
+            ? { ...currentMessage, content: currentMessage.content + nextText }
+            : currentMessage,
+        ),
+      )
+    }
+
+    function scheduleTokenFlush() {
+      if (flushTimer) {
+        return
+      }
+
+      flushTimer = setTimeout(flushPendingTokens, STREAM_FLUSH_INTERVAL_MS)
+    }
+
+    function appendStreamToken(tokenText: string) {
+      pendingTokenText += tokenText
+
+      if (pendingTokenText.length >= STREAM_FORCE_FLUSH_CHARS || pendingTokenText.includes("\n\n")) {
+        flushPendingTokens()
+        return
+      }
+
+      scheduleTokenFlush()
+    }
+
     try {
-      const response = await fetch("/api/chat/stream", {
+      const response = await fetch(apiUrl("/api/chat/stream"), {
         method: "POST",
         headers: {
           Accept: "text/event-stream",
@@ -450,6 +645,10 @@ function App() {
 
       await readSseStream(response.body, ({ event, data }) => {
         if (event === "thread" || event === "done") {
+          if (event === "done") {
+            flushPendingTokens()
+          }
+
           const nextThreadId = threadIdFromPayload(data)
 
           if (nextThreadId) {
@@ -464,31 +663,52 @@ function App() {
           const tokenText = tokenTextFromPayload(data)
 
           if (tokenText) {
-            setMessages((current) =>
-              current.map((currentMessage) =>
-                currentMessage.id === helpMessageId
-                  ? { ...currentMessage, content: currentMessage.content + tokenText }
-                  : currentMessage,
-              ),
-            )
+            appendStreamToken(tokenText)
           }
 
           return
         }
 
         if (event === "error") {
+          flushPendingTokens()
           throw new Error(errorMessageFromPayload(data))
         }
       })
     } catch (caught) {
+      flushPendingTokens()
       const message = caught instanceof Error ? caught.message : "Unable to reach the help desk."
       setMessages((current) =>
         current.filter((currentMessage) => currentMessage.id !== helpMessageId || currentMessage.content.length > 0),
       )
       setError(message)
     } finally {
+      flushPendingTokens()
       setIsSending(false)
     }
+  }
+
+  async function submitMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const message = draft.trim()
+
+    if (!message || isSending) {
+      return
+    }
+
+    setDraft("")
+    await sendMessage(message)
+  }
+
+  function startNewChat() {
+    if (isSending) {
+      return
+    }
+
+    localStorage.removeItem(THREAD_STORAGE_KEY)
+    setThreadId(null)
+    setMessages(starterMessages)
+    setDraft("")
+    setError(null)
   }
 
   return (
@@ -504,9 +724,22 @@ function App() {
               <p className="text-sm text-zinc-400">Plain answers from your plant documents</p>
             </div>
           </div>
-          <div className="flex items-center gap-2 rounded-md border border-zinc-800 px-3 py-2 text-xs text-zinc-300">
-            <ShieldCheck className="size-4 text-emerald-400" aria-hidden="true" />
-            <span>{threadId ? "Conversation saved" : "New conversation"}</span>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              className="border-zinc-700 bg-zinc-950 text-zinc-50 hover:bg-zinc-900 hover:text-zinc-50"
+              disabled={isSending}
+              onClick={startNewChat}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              <Plus className="size-4" aria-hidden="true" />
+              New chat
+            </Button>
+            <div className="flex items-center gap-2 rounded-md border border-zinc-800 px-3 py-2 text-xs text-zinc-300">
+              <ShieldCheck className="size-4 text-emerald-400" aria-hidden="true" />
+              <span>{threadId ? "Conversation saved" : "New conversation"}</span>
+            </div>
           </div>
         </header>
 
@@ -521,8 +754,13 @@ function App() {
                   <li>Quality standards</li>
                 </ul>
               </div>
+              <CommonQuestionsSection
+                isSending={isSending}
+                onQuestionClick={sendMessage}
+                questions={commonQuestions}
+              />
               <div className="rounded-md border border-zinc-800 bg-zinc-900/60 p-3">
-                More detailed answers and follow-up help will be added in the next update.
+                Answers include citations and source confidence when plant document sections support the response.
               </div>
             </div>
           </aside>
@@ -546,15 +784,15 @@ function App() {
                     {message.role === "worker" ? (
                       <p className="whitespace-pre-wrap">{message.content}</p>
                     ) : (
-                      <MarkdownContent content={message.content} />
+                      <HelpMessageContent content={message.content} />
                     )}
                   </article>
                 ))}
 
-                {isSending ? (
+                {isAwaitingFirstResponse ? (
                   <div className="flex items-center gap-2 text-sm text-zinc-400">
                     <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-                    Checking the request.
+                    Checking plant documents.
                   </div>
                 ) : null}
                 <div ref={messagesEndRef} />
@@ -569,11 +807,18 @@ function App() {
             ) : null}
 
             <form className="border-t border-zinc-800 p-4 sm:p-5" onSubmit={submitMessage}>
+              <CommonQuestionsSection
+                className="mb-4 lg:hidden"
+                isSending={isSending}
+                onQuestionClick={sendMessage}
+                questions={commonQuestions}
+              />
               <div className="flex gap-3">
                 <Textarea
                   aria-label="Message"
                   className="min-h-11 resize-none border-zinc-700 bg-zinc-950 text-zinc-50 placeholder:text-zinc-500"
                   disabled={isSending}
+                  maxLength={CHAT_MESSAGE_MAX_LENGTH}
                   onChange={(event) => setDraft(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {

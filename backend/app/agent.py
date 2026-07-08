@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from langchain.agents import create_agent
@@ -12,6 +13,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
+from app.cache import JsonCache, build_json_cache, rag_answer_cache_key
 from app.config import Settings, get_settings
 from app.guardrails import build_agent_guardrails
 from app.memory_store import build_postgres_memory_store
@@ -41,10 +43,85 @@ SPECIALIST_TOOL_NAMES = frozenset(
     }
 )
 
+SOURCE_CONFIDENCE_LABEL = "Source confidence"
+
+DIRECT_ROUTE_KEYWORDS: Mapping[str, tuple[tuple[str, int], ...]] = {
+    "safety": (
+        ("hydraulic leak", 5),
+        ("lockout", 4),
+        ("tagout", 4),
+        ("loto", 4),
+        ("hot work", 4),
+        ("fire watch", 4),
+        ("spill", 3),
+        ("ppe", 3),
+        ("permit", 2),
+        ("hazard", 2),
+        ("emergency", 2),
+        ("absorbent", 2),
+        ("cleanup", 2),
+        ("injury", 2),
+        ("leak", 1),
+    ),
+    "maintenance": (
+        ("pump motor", 5),
+        ("hydraulic press", 5),
+        ("photoeye", 4),
+        ("sensor", 3),
+        ("overheat", 3),
+        ("thermal overload", 3),
+        ("preventive maintenance", 3),
+        ("belt tracking", 3),
+        ("conveyor belt", 3),
+        ("troubleshoot", 3),
+        ("motor", 2),
+        ("pump", 2),
+        ("bearing", 2),
+        ("repair", 2),
+        ("inspection", 1),
+    ),
+    "quality": (
+        ("quality hold", 5),
+        ("nonconforming", 5),
+        ("out of tolerance", 4),
+        ("sampling", 4),
+        ("tool change", 4),
+        ("changeover", 3),
+        ("torque", 3),
+        ("calibration", 3),
+        ("defect", 3),
+        ("acceptance", 2),
+        ("gauge", 2),
+        ("dimension", 2),
+        ("surface", 2),
+        ("burr", 2),
+        ("hold", 2),
+    ),
+}
+
+MEMORY_ROUTE_TERMS = (
+    "remember",
+    "recall",
+    "memory",
+    "preference",
+    "what did i say",
+    "what did we discuss",
+)
+
+
+RouteKey = Literal["safety", "maintenance", "quality", "memory", "ambiguous"]
+DOMAIN_ROUTE_KEYS = frozenset({"safety", "maintenance", "quality"})
+
 
 class SourceGrade(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=1)
+
+
+class RouteDecision(BaseModel):
+    route: RouteKey
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(min_length=1)
 
 
 class ChatAgent(Protocol):
@@ -70,6 +147,71 @@ class AnswerGenerator(Protocol):
         """Generate a grounded answer from retrieved source sections."""
 
 
+class QuestionRouter:
+    def __init__(self, *, settings: Settings | None = None, model: str | None = None) -> None:
+        self._settings = settings or get_settings()
+        self._model = model or _settings_value(self._settings, "router_model") or _settings_value(
+            self._settings,
+            "supervisor_model",
+        ) or _settings_value(self._settings, "chat_model", "claude-sonnet-4-6")
+        self._agent: Any | None = None
+
+    def route(self, message: str) -> RouteDecision:
+        deterministic = _deterministic_route_decision(message)
+        if deterministic.route != "ambiguous":
+            return deterministic
+        return self._llm_route(message)
+
+    def _llm_route(self, message: str) -> RouteDecision:
+        try:
+            result = self._compiled_agent().invoke(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Route this manufacturing help-desk question to exactly one route.\n"
+                                f"Question: {message}"
+                            ),
+                        }
+                    ]
+                }
+            )
+        except Exception:
+            return RouteDecision(route="ambiguous", confidence=0.0, reason="Router model failed.")
+
+        structured = result.get("structured_response") if isinstance(result, dict) else None
+        if isinstance(structured, RouteDecision):
+            return structured
+        if isinstance(structured, dict):
+            try:
+                return RouteDecision.model_validate(structured)
+            except Exception:
+                return RouteDecision(route="ambiguous", confidence=0.0, reason="Router model returned invalid output.")
+        return RouteDecision(route="ambiguous", confidence=0.0, reason="Router model returned no route decision.")
+
+    def _compiled_agent(self) -> Any:
+        if self._agent is None:
+            self._agent = create_agent(
+                model=self._model,
+                tools=[],
+                middleware=build_agent_guardrails(run_limit=1),
+                response_format=RouteDecision,
+                system_prompt="""You are a manufacturing help-desk router.
+
+Choose exactly one route:
+- safety: hazards, PPE, lockout/tagout, emergency response, spills, permits, safe work practices
+- maintenance: troubleshooting, inspections, service intervals, repairs, sensors, motors, pumps, hydraulics
+- quality: tolerances, sampling, defects, calibration, quality holds, disposition, acceptance criteria
+- memory: the user asks to remember, recall, or use prior conversation/workspace context
+- ambiguous: the question is unclear, out of scope, or cannot be safely routed to one source
+
+Return a route decision only. Do not answer the question.
+""",
+            )
+        return self._agent
+
+
 class LLMSourceGrader:
     def __init__(self, *, model: str, settings: Settings | None = None) -> None:
         settings = settings or get_settings()
@@ -80,7 +222,16 @@ class LLMSourceGrader:
             response_format=SourceGrade,
             system_prompt="""You grade retrieved manufacturing documentation excerpts.
 
-Return a confidence score from 0 to 1 for whether the excerpts are relevant, specific, and sufficient to answer the question without fabrication. Prefer low confidence when the excerpts are only topically related, omit key constraints, or come from the wrong documentation source.
+Return a confidence score from 0 to 1 for whether the excerpts are relevant, specific, and sufficient to answer the question without fabrication.
+
+Use this rubric:
+- 0.90-1.00: The excerpts directly answer the question and include the required operational details.
+- 0.85-0.89: The excerpts clearly support the answer with only minor non-critical omissions.
+- 0.72-0.84: The excerpts support the core answer but are incomplete or ambiguous.
+- 0.40-0.71: The excerpts are topical but not sufficient for a confident answer.
+- 0.00-0.39: The excerpts come from the wrong source, no relevant excerpts were retrieved, or an answer would require fabrication.
+
+Prefer scores of at least 0.85 for exact-match source-backed questions. Prefer low confidence when the excerpts are only topically related, omit key constraints, or come from the wrong documentation source.
 """,
         )
 
@@ -140,6 +291,36 @@ Answer only from the provided source excerpts. Ground every operational claim in
         )
         return _message_text(result["messages"][-1])
 
+    def stream_generate(self, question: str, source: RagSource, sections: Sequence[tuple[Document, float]]) -> Iterator[str]:
+        final_message = ""
+        emitted_token = False
+
+        for mode, data in self._agent.stream(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Question: {question}\n\n"
+                            f"Source excerpts:\n{_format_sections(sections)}\n\n"
+                            "Produce a concise answer for a floor supervisor. Include citations."
+                        ),
+                    }
+                ]
+            },
+            stream_mode=["messages", "values"],
+        ):
+            if mode == "messages":
+                token_text = _stream_model_token_text(data)
+                if token_text:
+                    emitted_token = True
+                    yield token_text
+            elif mode == "values":
+                final_message = _stream_final_message_text(data) or final_message
+
+        if not emitted_token and final_message:
+            yield final_message
+
 
 class SpecialistRagAgent:
     def __init__(
@@ -150,6 +331,7 @@ class SpecialistRagAgent:
         retriever: Retriever | None = None,
         grader: SourceGrader | None = None,
         answer_generator: AnswerGenerator | None = None,
+        cache: JsonCache | None = None,
         model: str | None = None,
     ) -> None:
         self.source = source
@@ -157,6 +339,7 @@ class SpecialistRagAgent:
         resolved_model = model or _settings_value(self._settings, "specialist_model") or _settings_value(
             self._settings, "chat_model", "claude-sonnet-4-6"
         )
+        self._model = resolved_model
         self._retriever = retriever or build_pgvector_store(self._settings, source.collection_name)
         self._grader = grader
         if self._settings.rag_use_llm_grader and self._grader is None:
@@ -166,6 +349,7 @@ class SpecialistRagAgent:
             model=resolved_model,
             settings=self._settings,
         )
+        self._cache = cache or build_json_cache(self._settings)
 
     def answer(self, question: str) -> str:
         with langsmith_trace(
@@ -183,16 +367,113 @@ class SpecialistRagAgent:
             end_langsmith_trace(run, {"answer": answer})
             return answer
 
+    def stream_answer(self, question: str) -> Iterator[str]:
+        with langsmith_trace(
+            "specialist_rag_answer_stream",
+            settings=self._settings,
+            inputs={"question": question},
+            metadata={
+                "source_key": self.source.key,
+                "source_name": self.source.display_name,
+                "collection_name": self.source.collection_name,
+                "streaming": True,
+            },
+            tags=["manufacturing-agent", "rag", self.source.key, "streaming"],
+        ) as run:
+            chunks: list[str] = []
+            for chunk in self._stream_answer(question):
+                chunks.append(chunk)
+                yield chunk
+            end_langsmith_trace(run, {"answer": "".join(chunks)})
+
     def _answer(self, question: str) -> str:
+        cache_key = rag_answer_cache_key(
+            settings=self._settings,
+            source=self.source,
+            question=question,
+            model=self._model,
+        )
+        if cache_key:
+            cached = self._cache.get_json(cache_key)
+            if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
+                return cached["answer"]
+
+        answer = self._answer_uncached(question)
+        if cache_key:
+            self._cache.set_json(
+                cache_key,
+                {"answer": answer},
+                ttl_seconds=self._settings.rag_cache_ttl_seconds,
+            )
+        return answer
+
+    def _stream_answer(self, question: str) -> Iterator[str]:
+        cache_key = rag_answer_cache_key(
+            settings=self._settings,
+            source=self.source,
+            question=question,
+            model=self._model,
+        )
+        if cache_key:
+            cached = self._cache.get_json(cache_key)
+            if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
+                yield cached["answer"]
+                return
+
+        if self._settings.rag_use_llm_grader:
+            answer = self._answer(question)
+            yield answer
+            return
+
+        chunks: list[str] = []
+        for chunk in self._stream_answer_uncached(question):
+            chunks.append(chunk)
+            yield chunk
+
+        if cache_key:
+            self._cache.set_json(
+                cache_key,
+                {"answer": "".join(chunks)},
+                ttl_seconds=self._settings.rag_cache_ttl_seconds,
+            )
+
+    def _stream_answer_uncached(self, question: str) -> Iterator[str]:
+        sections = self._retriever.similarity_search_with_score(question, k=self._settings.rag_top_k)
+        if not sections:
+            answer = _append_confidence_footer(
+                f"A confident answer could not be produced from {self.source.display_name} because "
+                "no relevant source sections were retrieved. Escalate to the approved plant document owner "
+                "or floor supervisor instead of relying on an unsupported answer.",
+                0.0,
+            )
+            yield answer
+            return answer
+
+        confidence = _retrieval_confidence(sections)
+        chunks: list[str] = []
+        for chunk in _stream_answer_generator(self._answer_generator, question, self.source, sections):
+            chunks.append(chunk)
+            yield chunk
+
+        footer = f"\n\n**{SOURCE_CONFIDENCE_LABEL}:** {_confidence_percent(confidence)}%"
+        chunks.append(footer)
+        yield footer
+        return "".join(chunks)
+
+    def _answer_uncached(self, question: str) -> str:
         if not self._settings.rag_use_llm_grader:
             sections = self._retriever.similarity_search_with_score(question, k=self._settings.rag_top_k)
             if not sections:
-                return (
+                return _append_confidence_footer(
                     f"A confident answer could not be produced from {self.source.display_name} because "
                     "no relevant source sections were retrieved. Escalate to the approved plant document owner "
-                    "or floor supervisor instead of relying on an unsupported answer."
+                    "or floor supervisor instead of relying on an unsupported answer.",
+                    0.0,
                 )
-            return self._answer_generator.generate(question, self.source, sections)
+            return _append_confidence_footer(
+                self._answer_generator.generate(question, self.source, sections),
+                _retrieval_confidence(sections),
+            )
 
         if self._grader is None:
             raise RuntimeError("RAG LLM grading is enabled, but no source grader is configured.")
@@ -207,13 +488,16 @@ class SpecialistRagAgent:
                 best_grade = grade
 
             if grade.confidence >= self._settings.rag_confidence_threshold:
-                return self._answer_generator.generate(question, self.source, sections)
+                return _append_confidence_footer(
+                    self._answer_generator.generate(question, self.source, sections),
+                    grade.confidence,
+                )
 
-        return (
+        return _append_confidence_footer(
             f"A confident answer could not be produced from {self.source.display_name} after "
-            f"{max_attempts} retrieval attempts. The best source confidence was "
-            f"{best_grade.confidence:.2f}. Reason: {best_grade.reasoning} "
-            "Escalate to the approved plant document owner or floor supervisor instead of relying on an unsupported answer."
+            f"{max_attempts} retrieval attempts. Reason: {best_grade.reasoning} "
+            "Escalate to the approved plant document owner or floor supervisor instead of relying on an unsupported answer.",
+            best_grade.confidence,
         )
 
     def _retry_queries(self, question: str) -> list[str]:
@@ -230,34 +514,39 @@ class SupervisorAgent:
         *,
         specialists: Mapping[str, SpecialistRagAgent] | None = None,
         model: str | None = None,
+        router: QuestionRouter | None = None,
         settings: Settings | None = None,
         store: BaseStore | None = None,
     ) -> None:
         settings = settings or get_settings()
         self._settings = settings
-        supervisor_model = model or _settings_value(settings, "supervisor_model") or _settings_value(
+        self._supervisor_model = model or _settings_value(settings, "supervisor_model") or _settings_value(
             settings, "chat_model", "claude-sonnet-4-6"
         )
-        specialist_model = _settings_value(settings, "specialist_model") or _settings_value(
+        self._specialist_model = _settings_value(settings, "specialist_model") or _settings_value(
             settings, "chat_model", "claude-sonnet-4-6"
         )
-        self._specialists = specialists or build_default_specialists(model=specialist_model)
-        self._store = store or build_postgres_memory_store(settings)
+        self._router = router or QuestionRouter(settings=settings)
+        self._specialists = dict(specialists or {})
+        self._store = store
+        self._agent: Any | None = None
 
+    def _build_agent(self) -> Any:
         def answer_safety_procedure_question(question: str) -> str:
             """Use for hazards, PPE, lockout/tagout, emergency response, spills, permits, and safe work practices."""
-            return self._specialists["safety"].answer(question)
+            return self._specialist("safety").answer(question)
 
         def answer_maintenance_manual_question(question: str) -> str:
             """Use for equipment troubleshooting, inspections, service intervals, repairs, sensors, motors, pumps, and hydraulics."""
-            return self._specialists["maintenance"].answer(question)
+            return self._specialist("maintenance").answer(question)
 
         def answer_quality_control_question(question: str) -> str:
             """Use for tolerances, sampling, defects, calibration, holds, disposition, and acceptance criteria."""
-            return self._specialists["quality"].answer(question)
+            return self._specialist("quality").answer(question)
 
-        self._agent = create_agent(
-            model=supervisor_model,
+        self._store = self._store or build_postgres_memory_store(self._settings)
+        return create_agent(
+            model=self._supervisor_model,
             tools=[
                 _return_direct_tool(answer_safety_procedure_question),
                 _return_direct_tool(answer_maintenance_manual_question),
@@ -266,13 +555,33 @@ class SupervisorAgent:
                 recall_memory,
             ],
             system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-            middleware=build_agent_guardrails(run_limit=settings.supervisor_model_call_run_limit),
+            middleware=build_agent_guardrails(run_limit=self._settings.supervisor_model_call_run_limit),
             checkpointer=InMemorySaver(),
             store=self._store,
         )
 
+    def _compiled_agent(self) -> Any:
+        if self._agent is None:
+            self._agent = self._build_agent()
+        return self._agent
+
+    def _specialist(self, source_key: str) -> SpecialistRagAgent:
+        specialist = self._specialists.get(source_key)
+        if specialist is None:
+            specialist = SpecialistRagAgent(
+                RAG_SOURCES[source_key],
+                settings=self._settings,
+                model=self._specialist_model,
+            )
+            self._specialists[source_key] = specialist
+        return specialist
+
     def invoke(self, message: str, thread_id: str | None = None) -> tuple[str, str]:
         resolved_thread_id = thread_id or str(uuid4())
+        route_decision = self._router.route(message)
+        if route_decision.route in DOMAIN_ROUTE_KEYS:
+            return self._specialist(route_decision.route).answer(message), resolved_thread_id
+
         with langsmith_trace(
             "supervisor_chat",
             settings=self._settings,
@@ -280,7 +589,7 @@ class SupervisorAgent:
             metadata={"thread_id": resolved_thread_id},
             tags=["manufacturing-agent", "supervisor"],
         ) as run:
-            result = self._agent.invoke(
+            result = self._compiled_agent().invoke(
                 {"messages": [{"role": "user", "content": message}]},
                 {
                     "configurable": {"thread_id": resolved_thread_id},
@@ -295,7 +604,14 @@ class SupervisorAgent:
 
     def stream(self, message: str, thread_id: str | None = None) -> tuple[Iterator[str], str]:
         resolved_thread_id = thread_id or str(uuid4())
+        route_decision = self._router.route(message)
+        if route_decision.route in DOMAIN_ROUTE_KEYS:
+            return self._stream_direct_specialist(message, route_decision.route), resolved_thread_id
+
         return self._stream_with_observability(message, resolved_thread_id), resolved_thread_id
+
+    def _stream_direct_specialist(self, message: str, source_key: str) -> Iterator[str]:
+        yield from self._specialist(source_key).stream_answer(message)
 
     def _stream_with_observability(self, message: str, thread_id: str) -> Iterator[str]:
         with langsmith_trace(
@@ -317,7 +633,7 @@ class SupervisorAgent:
         emitted_tool_call_ids: set[str] = set()
         tool_result_seen = False
 
-        for mode, data in self._agent.stream(
+        for mode, data in self._compiled_agent().stream(
             {"messages": [{"role": "user", "content": message}]},
             {
                 "configurable": {"thread_id": thread_id},
@@ -370,6 +686,51 @@ def _settings_value(settings: Any, name: str, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def _deterministic_route_decision(message: str) -> RouteDecision:
+    normalized = _normalize_route_text(message)
+    if any(term in normalized for term in MEMORY_ROUTE_TERMS):
+        return RouteDecision(route="memory", confidence=1.0, reason="Message includes memory intent.")
+
+    scores = {
+        source_key: sum(weight for term, weight in keywords if term in normalized)
+        for source_key, keywords in DIRECT_ROUTE_KEYWORDS.items()
+    }
+    best_source, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score < 2:
+        return RouteDecision(route="ambiguous", confidence=0.0, reason="No deterministic route matched.")
+
+    tied_sources = [source_key for source_key, score in scores.items() if score == best_score]
+    if len(tied_sources) != 1:
+        return RouteDecision(route="ambiguous", confidence=0.0, reason="Multiple deterministic routes tied.")
+    return RouteDecision(
+        route=best_source,
+        confidence=min(1.0, best_score / 5),
+        reason=f"Matched deterministic {best_source} terms.",
+    )
+
+
+def _direct_source_key(message: str) -> str | None:
+    decision = _deterministic_route_decision(message)
+    return decision.route if decision.route in DOMAIN_ROUTE_KEYS else None
+
+
+def _normalize_route_text(message: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", message.casefold())).strip()
+
+
+def _stream_answer_generator(
+    generator: AnswerGenerator,
+    question: str,
+    source: RagSource,
+    sections: Sequence[tuple[Document, float]],
+) -> Iterator[str]:
+    stream_generate = getattr(generator, "stream_generate", None)
+    if callable(stream_generate):
+        yield from stream_generate(question, source, sections)
+        return
+    yield generator.generate(question, source, sections)
+
+
 def _format_sections(sections: Sequence[tuple[Document, float]]) -> str:
     formatted: list[str] = []
     for index, (document, score) in enumerate(sections, start=1):
@@ -381,6 +742,33 @@ def _format_sections(sections: Sequence[tuple[Document, float]]) -> str:
             f"{document.page_content}"
         )
     return "\n\n".join(formatted)
+
+
+def _append_confidence_footer(answer: str, confidence: float) -> str:
+    return f"{answer.rstrip()}\n\n**{SOURCE_CONFIDENCE_LABEL}:** {_confidence_percent(confidence)}%"
+
+
+def _confidence_percent(confidence: float) -> int:
+    return round(_clamp_confidence(confidence) * 100)
+
+
+def _retrieval_confidence(sections: Sequence[tuple[Document, float]]) -> float:
+    if not sections:
+        return 0.0
+
+    return max(_score_to_confidence(score) for _, score in sections)
+
+
+def _score_to_confidence(score: float) -> float:
+    if score < 0:
+        return 0.0
+    if score <= 1:
+        return _clamp_confidence(1 - score)
+    return _clamp_confidence(1 / (1 + score))
+
+
+def _clamp_confidence(confidence: float) -> float:
+    return max(0.0, min(1.0, confidence))
 
 
 def _message_text(message: Any) -> str:
@@ -408,6 +796,17 @@ def _stream_token_text(data: Any, *, tool_result_seen: bool) -> str:
     if not isinstance(message, AIMessageChunk):
         return ""
     if metadata.get("langgraph_node") != "model":
+        return ""
+
+    return _message_text(message)
+
+
+def _stream_model_token_text(data: Any) -> str:
+    message, metadata = _stream_message_parts(data)
+
+    if not isinstance(message, AIMessageChunk):
+        return ""
+    if metadata and metadata.get("langgraph_node") != "model":
         return ""
 
     return _message_text(message)
