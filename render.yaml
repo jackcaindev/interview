@@ -2,7 +2,8 @@ services:
   - type: web
     name: manufacturing-agent-api
     runtime: docker
-    rootDir: backend
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
     healthCheckPath: /health
     preDeployCommand: uv run python -m app.prepare_database && uv run python -m app.ingest_sources --reset
     envVars:
@@ -45,9 +46,8 @@ services:
   - type: web
     name: manufacturing-agent-web
     runtime: static
-    rootDir: frontend
-    buildCommand: corepack enable && corepack prepare pnpm@10.33.3 --activate && pnpm install --frozen-lockfile && pnpm build
-    staticPublishPath: dist
+    buildCommand: cd frontend && corepack enable && corepack prepare pnpm@10.33.3 --activate && pnpm install --frozen-lockfile && pnpm build
+    staticPublishPath: frontend/dist
     envVars:
       - key: VITE_API_BASE_URL
         value: https://manufacturing-agent-api.onrender.com
