@@ -49,6 +49,8 @@ services:
     buildCommand: cd frontend && corepack enable && corepack prepare pnpm@10.33.3 --activate && pnpm install --frozen-lockfile && pnpm build
     staticPublishPath: frontend/dist
     envVars:
+      - key: NODE_VERSION
+        value: 22.16.0
       - key: VITE_API_BASE_URL
         value: https://manufacturing-agent-api.onrender.com
     routes:
