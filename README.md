@@ -78,47 +78,62 @@ The ingestion uses OpenAI embeddings with `OPENAI_EMBEDDING_MODEL=text-embedding
 
 ## Production Deployment
 
-Recommended submission setup:
+Render deployment is defined in `render.yaml` with these managed resources:
 
-1. Host Postgres with pgvector enabled.
-2. Deploy `backend/` as a Docker web service.
-3. Deploy `frontend/` as a static site.
-4. Run source ingestion after the database is available.
+- `manufacturing-agent-api`: Docker web service for `backend/`
+- `manufacturing-agent-web`: static site for `frontend/`
+- `manufacturing-agent-db`: Render Postgres 16 with private-only network access
+- `manufacturing-agent-cache`: Render Key Value cache with private-only network access
+
+The backend pre-deploy command runs:
+
+```bash
+uv run python -m app.prepare_database && uv run python -m app.ingest_sources --reset
+```
+
+This enables `pgvector` with `CREATE EXTENSION IF NOT EXISTS vector` and ingests the seed plant documents before the service starts serving traffic.
 
 Backend environment variables:
 
 ```bash
 ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
-DATABASE_URL=postgresql://...
+HELP_DESK_ACCESS_TOKEN=<shared demo access code>
+DATABASE_URL=<from manufacturing-agent-db>
+REDIS_URL=<from manufacturing-agent-cache>
 CHAT_MODEL=claude-sonnet-4-6
 ROUTER_MODEL=
-CORS_ALLOWED_ORIGINS=https://your-frontend.example
+CORS_ALLOWED_ORIGINS=https://manufacturing-agent-web.onrender.com
 LANGSMITH_TRACING=false
+LANGSMITH_API_KEY=
 ```
 
 Frontend environment variables:
 
 ```bash
-VITE_API_BASE_URL=https://your-backend.example
+VITE_API_BASE_URL=https://manufacturing-agent-api.onrender.com
 ```
 
-For static hosting, set the frontend project root to `frontend`, build command to `pnpm build`, and publish directory to `dist`. When `VITE_API_BASE_URL` is set, the browser calls the hosted backend directly. When it is blank, local development uses the Vite `/api` proxy.
+`VITE_API_BASE_URL` and `CORS_ALLOWED_ORIGINS` must be updated together if Render assigns different public hostnames because of a naming collision. When `VITE_API_BASE_URL` is set, the browser calls the hosted backend directly. When it is blank, local development uses the Vite `/api` proxy.
 
-After the backend and database are live, run:
+Required secrets are `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `HELP_DESK_ACCESS_TOKEN`. The access token protects the public chat endpoints from casual abuse; the frontend prompts for this code and sends it to the backend as a bearer token. LangSmith is optional; set `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, and `LANGSMITH_PROJECT` only when tracing should be enabled. The local `.env` file is ignored by git, but rotate any local keys if they have been copied, logged, or shared outside this machine.
+
+For an interview demo, generate a short-lived random code, for example:
 
 ```bash
-cd backend
-uv run python -m app.ingest_sources --reset
+openssl rand -base64 24
 ```
+
+Give the interviewer `https://manufacturing-agent-web.onrender.com` and the access code. Rotate `HELP_DESK_ACCESS_TOKEN` or suspend the Render services after the interview window.
 
 Pre-submit checks:
 
 ```bash
 npm run build:frontend
 UV_CACHE_DIR=/tmp/uv-cache npm run test:backend
-curl https://your-backend.example/health
-curl https://your-backend.example/ready
+docker compose config --quiet
+curl https://manufacturing-agent-api.onrender.com/health
+curl https://manufacturing-agent-api.onrender.com/ready
 ```
 
 Then open the frontend URL and ask a safety, maintenance, or quality question. A production-ready answer should include citations and a source-confidence score.

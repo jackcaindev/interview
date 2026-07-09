@@ -3,6 +3,7 @@ from collections.abc import Iterator
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings, get_settings
 from app.main import app, get_chat_agent
 
 
@@ -16,6 +17,12 @@ class FakeAgent:
 
 def client() -> TestClient:
     app.dependency_overrides[get_chat_agent] = lambda: FakeAgent()
+    return TestClient(app)
+
+
+def protected_client() -> TestClient:
+    app.dependency_overrides[get_chat_agent] = lambda: FakeAgent()
+    app.dependency_overrides[get_settings] = lambda: Settings(HELP_DESK_ACCESS_TOKEN="interview-code")
     return TestClient(app)
 
 
@@ -83,6 +90,35 @@ def test_chat_rejects_missing_message() -> None:
     assert response.status_code == 422
 
 
+def test_chat_requires_access_token_when_configured() -> None:
+    response = protected_client().post("/chat", json={"message": "Which procedure covers a hydraulic leak?"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Access code is required."
+
+
+def test_chat_rejects_wrong_access_token_when_configured() -> None:
+    response = protected_client().post(
+        "/chat",
+        headers={"Authorization": "Bearer wrong-code"},
+        json={"message": "Which procedure covers a hydraulic leak?"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Access code is invalid."
+
+
+def test_chat_accepts_access_token_when_configured() -> None:
+    response = protected_client().post(
+        "/chat",
+        headers={"Authorization": "Bearer interview-code"},
+        json={"message": "Which procedure covers a hydraulic leak?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["thread_id"] == "generated-thread"
+
+
 def test_common_questions_returns_stable_clickable_questions() -> None:
     response = client().get("/common-questions")
 
@@ -136,6 +172,12 @@ def test_common_questions_have_non_empty_fields() -> None:
         assert question["question"]
 
 
+def test_common_questions_require_access_token_when_configured() -> None:
+    response = protected_client().get("/common-questions")
+
+    assert response.status_code == 401
+
+
 def test_chat_stream_generates_thread_id_when_missing() -> None:
     response = client().post("/chat/stream", json={"message": "Which procedure covers a hydraulic leak?"})
 
@@ -164,6 +206,17 @@ def test_chat_stream_rejects_blank_message() -> None:
     response = client().post("/chat/stream", json={"message": "   "})
 
     assert response.status_code == 422
+
+
+def test_chat_stream_accepts_access_token_when_configured() -> None:
+    response = protected_client().post(
+        "/chat/stream",
+        headers={"Authorization": "Bearer interview-code"},
+        json={"message": "Which procedure covers a hydraulic leak?"},
+    )
+
+    assert response.status_code == 200
+    assert parse_sse(response.text)[-1] == ("done", {"thread_id": "generated-thread"})
 
 
 def parse_sse(payload: str) -> list[tuple[str, dict[str, str]]]:

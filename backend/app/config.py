@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     langsmith_tracing: str = Field(default="false", alias="LANGSMITH_TRACING")
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY")
     langsmith_project: str = Field(default="manufacturing-supervisor", alias="LANGSMITH_PROJECT")
+    help_desk_access_token: str = Field(default="", alias="HELP_DESK_ACCESS_TOKEN")
     postgres_user: str = Field(default="postgres", alias="POSTGRES_USER")
     postgres_password: str = Field(default="postgres", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="manufacturing_agents", alias="POSTGRES_DB")

@@ -1,0 +1,68 @@
+services:
+  - type: web
+    name: manufacturing-agent-api
+    runtime: docker
+    rootDir: backend
+    healthCheckPath: /health
+    preDeployCommand: uv run python -m app.prepare_database && uv run python -m app.ingest_sources --reset
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: HELP_DESK_ACCESS_TOKEN
+        sync: false
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: DATABASE_URL
+        fromDatabase:
+          name: manufacturing-agent-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: manufacturing-agent-cache
+          property: connectionString
+      - key: CHAT_MODEL
+        value: claude-sonnet-4-6
+      - key: ROUTER_MODEL
+        value: ""
+      - key: RAG_USE_LLM_GRADER
+        value: "false"
+      - key: LANGSMITH_TRACING
+        value: "false"
+      - key: LANGSMITH_PROJECT
+        value: manufacturing-supervisor
+      - key: MEMORY_EMBEDDING_DIMENSIONS
+        value: "1536"
+      - key: REDIS_TIMEOUT_SECONDS
+        value: "0.5"
+      - key: RAG_CACHE_TTL_SECONDS
+        value: "900"
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://manufacturing-agent-web.onrender.com
+
+  - type: web
+    name: manufacturing-agent-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: corepack enable && corepack prepare pnpm@10.33.3 --activate && pnpm install --frozen-lockfile && pnpm build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        value: https://manufacturing-agent-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  - type: keyvalue
+    name: manufacturing-agent-cache
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+    persistenceMode: off
+
+databases:
+  - name: manufacturing-agent-db
+    postgresMajorVersion: "16"
+    ipAllowList: []

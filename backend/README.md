@@ -4,10 +4,15 @@ FastAPI backend exposing `POST /chat` for a LangChain supervisor agent that rout
 
 ```bash
 uv sync
+uv run python -m app.prepare_database
 uv run python -m app.ingest_sources --reset
 uv run uvicorn app.main:app --reload
 uv run pytest
 ```
+
+`app.prepare_database` is idempotent and enables the Postgres `vector` extension required by PGVector retrieval and long-term memory. Render runs it in the backend pre-deploy command before source ingestion.
+
+Set `HELP_DESK_ACCESS_TOKEN` in production to require a shared access code for `/common-questions`, `/chat`, and `/chat/stream`. Leave it blank for local development without an access prompt.
 
 ## Cache
 

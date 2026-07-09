@@ -1,7 +1,9 @@
 import json
 from collections.abc import Iterator
+from secrets import compare_digest
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -32,6 +34,24 @@ def _check_redis(redis_url: str, timeout_seconds: float) -> None:
         socket_timeout=timeout_seconds,
     )
     client.ping()
+
+
+def require_access_token(
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+    settings: Settings = Depends(get_settings),
+) -> None:
+    expected_token = settings.help_desk_access_token.strip()
+
+    if not expected_token:
+        return
+
+    scheme, _, token = (authorization or "").partition(" ")
+
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Access code is required.")
+
+    if not compare_digest(token, expected_token):
+        raise HTTPException(status_code=403, detail="Access code is invalid.")
 
 
 app = FastAPI(title="Manufacturing Supervisor Agent API")
@@ -116,18 +136,18 @@ def ready(settings: Settings = Depends(get_settings)) -> dict[str, str]:
     return {"status": "ready"}
 
 
-@app.get("/common-questions", response_model=CommonQuestionsResponse)
+@app.get("/common-questions", response_model=CommonQuestionsResponse, dependencies=[Depends(require_access_token)])
 def common_questions() -> CommonQuestionsResponse:
     return CommonQuestionsResponse(questions=list(COMMON_QUESTIONS))
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_access_token)])
 def chat(request: ChatRequest, agent: ChatAgent = Depends(get_chat_agent)) -> ChatResponse:
     message, thread_id = agent.invoke(request.message, request.thread_id)
     return ChatResponse(message=message, thread_id=thread_id)
 
 
-@app.post("/chat/stream")
+@app.post("/chat/stream", dependencies=[Depends(require_access_token)])
 def chat_stream(request: ChatRequest, agent: ChatAgent = Depends(get_chat_agent)) -> StreamingResponse:
     return StreamingResponse(
         _chat_stream_events(request, agent),

@@ -27,6 +27,7 @@ type CommonQuestion = {
 }
 
 const THREAD_STORAGE_KEY = "manufacturing-help-desk-conversation-id"
+const ACCESS_TOKEN_STORAGE_KEY = "manufacturing-help-desk-access-token"
 const CHAT_MESSAGE_MAX_LENGTH = 2000
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "")
 const STREAM_FLUSH_INTERVAL_MS = 140
@@ -141,6 +142,22 @@ function apiUrl(path: string) {
   }
 
   return `${API_BASE_URL}${path.replace(/^\/api/, "")}`
+}
+
+function accessTokenHeaders(accessToken: string): Record<string, string> {
+  const token = accessToken.trim()
+
+  if (!token) {
+    return {}
+  }
+
+  return {
+    Authorization: `Bearer ${token}`,
+  }
+}
+
+function isAccessDeniedStatus(status: number) {
+  return status === 401 || status === 403
 }
 
 function commonQuestionsFromPayload(payload: unknown) {
@@ -503,6 +520,10 @@ function App() {
   const [commonQuestions, setCommonQuestions] = useState<CommonQuestion[]>([])
   const [draft, setDraft] = useState("")
   const [threadId, setThreadId] = useState<string | null>(() => localStorage.getItem(THREAD_STORAGE_KEY))
+  const [accessToken, setAccessToken] = useState(() => localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) ?? "")
+  const [accessDraft, setAccessDraft] = useState("")
+  const [isAccessRequired, setIsAccessRequired] = useState(false)
+  const [accessError, setAccessError] = useState<string | null>(null)
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -519,7 +540,24 @@ function App() {
 
     async function loadCommonQuestions() {
       try {
-        const response = await fetch(apiUrl("/api/common-questions"))
+        const response = await fetch(apiUrl("/api/common-questions"), {
+          headers: accessTokenHeaders(accessToken),
+        })
+
+        if (isAccessDeniedStatus(response.status)) {
+          localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY)
+
+          if (!isCancelled) {
+            setAccessToken("")
+            setIsAccessRequired(true)
+            setAccessError(
+              response.status === 403 ? "That access code was not accepted." : "Enter the access code to use the demo.",
+            )
+            setCommonQuestions([])
+          }
+
+          return
+        }
 
         if (!response.ok) {
           throw new Error(`Request failed with status ${response.status}`)
@@ -543,9 +581,10 @@ function App() {
     return () => {
       isCancelled = true
     }
-  }, [])
+  }, [accessToken])
 
-  const canSend = useMemo(() => draft.trim().length > 0 && !isSending, [draft, isSending])
+  const isChatLocked = isAccessRequired && !accessToken.trim()
+  const canSend = useMemo(() => draft.trim().length > 0 && !isSending && !isChatLocked, [draft, isChatLocked, isSending])
   const isAwaitingFirstResponse = useMemo(() => {
     const latestMessage = messages.at(-1)
 
@@ -556,6 +595,11 @@ function App() {
     const message = rawMessage.trim()
 
     if (!message || isSending) {
+      return
+    }
+
+    if (isChatLocked) {
+      setAccessError("Enter the access code to use the demo.")
       return
     }
 
@@ -628,12 +672,23 @@ function App() {
         headers: {
           Accept: "text/event-stream",
           "Content-Type": "application/json",
+          ...accessTokenHeaders(accessToken),
         },
         body: JSON.stringify({
           message,
           thread_id: threadId,
         }),
       })
+
+      if (isAccessDeniedStatus(response.status)) {
+        const authMessage =
+          response.status === 403 ? "That access code was not accepted." : "Enter the access code to use the demo."
+        localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY)
+        setAccessToken("")
+        setIsAccessRequired(true)
+        setAccessError(authMessage)
+        throw new Error(authMessage)
+      }
 
       if (!response.ok) {
         throw new Error(`Request failed with status ${response.status}`)
@@ -711,6 +766,36 @@ function App() {
     setError(null)
   }
 
+  function submitAccessCode(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const token = accessDraft.trim()
+
+    if (!token) {
+      setAccessError("Enter the access code to use the demo.")
+      return
+    }
+
+    localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token)
+    setAccessToken(token)
+    setAccessDraft("")
+    setAccessError(null)
+    setIsAccessRequired(false)
+    setError(null)
+  }
+
+  function clearAccessCode() {
+    if (isSending) {
+      return
+    }
+
+    localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY)
+    setAccessToken("")
+    setAccessDraft("")
+    setAccessError(null)
+    setIsAccessRequired(true)
+    setCommonQuestions([])
+  }
+
   return (
     <main className="min-h-svh bg-zinc-950 text-zinc-50">
       <div className="mx-auto flex min-h-svh w-full max-w-5xl flex-col px-4 py-5 sm:px-6 lg:px-8">
@@ -738,10 +823,52 @@ function App() {
             </Button>
             <div className="flex items-center gap-2 rounded-md border border-zinc-800 px-3 py-2 text-xs text-zinc-300">
               <ShieldCheck className="size-4 text-emerald-400" aria-hidden="true" />
-              <span>{threadId ? "Conversation saved" : "New conversation"}</span>
+              <span>{accessToken ? "Access code saved" : threadId ? "Conversation saved" : "New conversation"}</span>
             </div>
+            {accessToken ? (
+              <Button
+                className="border-zinc-700 bg-zinc-950 text-zinc-50 hover:bg-zinc-900 hover:text-zinc-50"
+                disabled={isSending}
+                onClick={clearAccessCode}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                Change code
+              </Button>
+            ) : null}
           </div>
         </header>
+
+        {isAccessRequired ? (
+          <section className="border-b border-zinc-800 py-5">
+            <form className="max-w-md space-y-3" onSubmit={submitAccessCode}>
+              <div>
+                <h2 className="text-sm font-medium text-zinc-100">Access code required</h2>
+                <p className="mt-1 text-sm text-zinc-400">Enter the demo access code shared with you.</p>
+              </div>
+              <div className="flex gap-3">
+                <input
+                  aria-label="Access code"
+                  className="h-11 min-w-0 flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-3 text-sm text-zinc-50 outline-none placeholder:text-zinc-500 focus:border-emerald-500"
+                  onChange={(event) => setAccessDraft(event.target.value)}
+                  placeholder="Access code"
+                  type="password"
+                  value={accessDraft}
+                />
+                <Button className="h-11 bg-emerald-500 text-zinc-950 hover:bg-emerald-400" type="submit">
+                  Unlock
+                </Button>
+              </div>
+              {accessError ? (
+                <div className="flex items-center gap-2 text-sm text-red-200">
+                  <AlertCircle className="size-4 shrink-0" aria-hidden="true" />
+                  <span>{accessError}</span>
+                </div>
+              ) : null}
+            </form>
+          </section>
+        ) : null}
 
         <section className="grid flex-1 gap-5 py-5 lg:grid-cols-[220px_minmax(0,1fr)]">
           <aside className="hidden border-r border-zinc-800 pr-5 text-sm text-zinc-400 lg:block">
@@ -755,7 +882,7 @@ function App() {
                 </ul>
               </div>
               <CommonQuestionsSection
-                isSending={isSending}
+                isSending={isSending || isChatLocked}
                 onQuestionClick={sendMessage}
                 questions={commonQuestions}
               />
@@ -809,7 +936,7 @@ function App() {
             <form className="border-t border-zinc-800 p-4 sm:p-5" onSubmit={submitMessage}>
               <CommonQuestionsSection
                 className="mb-4 lg:hidden"
-                isSending={isSending}
+                isSending={isSending || isChatLocked}
                 onQuestionClick={sendMessage}
                 questions={commonQuestions}
               />
@@ -817,7 +944,7 @@ function App() {
                 <Textarea
                   aria-label="Message"
                   className="min-h-11 resize-none border-zinc-700 bg-zinc-950 text-zinc-50 placeholder:text-zinc-500"
-                  disabled={isSending}
+                  disabled={isSending || isChatLocked}
                   maxLength={CHAT_MESSAGE_MAX_LENGTH}
                   onChange={(event) => setDraft(event.target.value)}
                   onKeyDown={(event) => {
@@ -826,7 +953,7 @@ function App() {
                       event.currentTarget.form?.requestSubmit()
                     }
                   }}
-                  placeholder="Example: What should I check for a pump vibration alarm?"
+                  placeholder={isChatLocked ? "Enter the access code above to start." : "Example: What should I check for a pump vibration alarm?"}
                   value={draft}
                 />
                 <Button
